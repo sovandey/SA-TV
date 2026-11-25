@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.SATV.Fullscreen" parent="Theme.SATV">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>
