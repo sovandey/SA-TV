@@ -1,7 +1,0 @@
-<resources>
-    <string name="app_name">SA TV</string>
-    <string name="search_hint">চ্যানেল খুঁজুন…</string>
-    <string name="refresh">রিফ্রেশ</string>
-    <string name="no_channels">কোনো চ্যানেল পাওয়া যায়নি</string>
-    <string name="play_error">ভিডিও চালানো যায়নি। ইন্টারনেট বা স্ট্রিম লিংক চেক করুন।</string>
-</resources>
