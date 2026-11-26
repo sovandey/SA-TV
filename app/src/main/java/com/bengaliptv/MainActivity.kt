@@ -28,7 +28,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
 import androidx.work.*
 import com.bengaliptv.work.PlaylistMonitorWorker
 import com.bengaliptv.data.Channel
@@ -103,8 +102,6 @@ private fun channelCategory(channel: Channel): String? {
 @Composable
 private fun SATVHome(channels: List<Channel>) {
     var selectedSport by remember { mutableStateOf("Indian Bengali") }
-    var selectedStatus by remember { mutableStateOf("All (79)") }
-    var selectedTab by remember { mutableStateOf("Live Events") }
     var searchMode by remember { mutableStateOf(false) }
     var searchText by remember { mutableStateOf("") }
     var playingChannel by remember { mutableStateOf<Channel?>(null) }
@@ -168,7 +165,7 @@ private fun SATVHome(channels: List<Channel>) {
                     Text("•", color = Color.Transparent, fontSize = 22.sp)
                     HeaderAction("↗") { searchMode = false }
                     Spacer(Modifier.width(18.dp))
-                    HeaderAction("⟳") { selectedStatus = "All (79)" }
+                    HeaderAction("⟳") { searchText = ""; selectedSport = "Indian Bengali" }
                     Spacer(Modifier.width(18.dp))
                     HeaderAction(if (searchMode) "×" else "⌕") {
                         searchMode = !searchMode
@@ -190,34 +187,10 @@ private fun SATVHome(channels: List<Channel>) {
                     .padding(start = 14.dp, top = 7.dp, bottom = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                CategoryChip("🇮🇳", "Indian Bengali", selectedSport == "Indian Bengali") { selectedSport = "Indian Bengali" }
-                CategoryChip("🇧🇩", "Bangladesh", selectedSport == "Bangladesh") { selectedSport = "Bangladesh" }
-                CategoryChip("🇮🇳", "Hindi", selectedSport == "Hindi") { selectedSport = "Hindi" }
-                CategoryChip("🏆", "Sports", selectedSport == "Sports") { selectedSport = "Sports" }
-            }
-
-            Row(
-                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-                    .padding(start = 12.dp, bottom = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                listOf("All (79)", "Live (6)", "Upcoming (69)", "Finished (4)").forEach { item ->
-                    FilterChip(
-                        selected = selectedStatus == item,
-                        onClick = { selectedStatus = item },
-                        label = { Text(item, fontSize = 15.sp) },
-                        modifier = Modifier.padding(end = 8.dp),
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = PanelAlt,
-                            selectedLabelColor = Color.White,
-                            containerColor = Panel,
-                            labelColor = Color.White
-                        ),
-                        border = FilterChipDefaults.filterChipBorder(
-                            enabled = true, selected = selectedStatus == item,
-                            borderColor = PanelAlt, selectedBorderColor = Accent
-                        )
-                    )
+                val cats = listOf("Indian Bengali" to "🇮🇳", "Bangladesh" to "🇧🇩", "Hindi" to "🇮🇳", "Sports" to "🏆")
+                cats.forEach { (name, icon) ->
+                    val n = channels.count { channelCategory(it) == name }
+                    if (n > 0) CategoryChip(icon, "$name ($n)", selectedSport == name) { selectedSport = name }
                 }
             }
 
@@ -247,7 +220,6 @@ private fun SATVHome(channels: List<Channel>) {
                 Spacer(Modifier.height(10.dp))
             }
 
-            BottomNavigation(selectedTab) { selectedTab = it }
         }
     }
 }
@@ -317,7 +289,14 @@ private fun LivePlayerScreen(
     onChannelChanged: (Channel) -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val player = remember { ExoPlayer.Builder(context).build() }
+    val player = remember {
+        val http = androidx.media3.datasource.DefaultHttpDataSource.Factory()
+            .setAllowCrossProtocolRedirects(true)
+            .setUserAgent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(androidx.media3.exoplayer.source.DefaultMediaSourceFactory(context).setDataSourceFactory(http))
+            .build()
+    }
     val exoPlayer = player
     var currentChannel by remember { mutableStateOf(initialChannel) }
     var controlsVisible by remember { mutableStateOf(true) }
@@ -326,6 +305,7 @@ private fun LivePlayerScreen(
     var fitMode by remember { mutableStateOf(false) }
     var playing by remember { mutableStateOf(true) }
     var errorText by remember { mutableStateOf<String?>(null) }
+    var videoRatio by remember { mutableStateOf(0f) }
 
     LaunchedEffect(currentChannel.url) {
         errorText = null
@@ -339,6 +319,10 @@ private fun LivePlayerScreen(
         val listener = object : androidx.media3.common.Player.Listener {
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                 errorText = "Stream could not be played. Try another channel."
+            }
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0)
+                    videoRatio = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
             }
         }
         exoPlayer.addListener(listener)
@@ -360,18 +344,24 @@ private fun LivePlayerScreen(
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         AndroidView(
             factory = { viewContext ->
-                PlayerView(viewContext).apply {
-                    useController = false
-                    resizeMode = if (fitMode) AspectRatioFrameLayout.RESIZE_MODE_FIT
-                        else AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                    this.player = exoPlayer
-                    setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
-                }
+                val frame = AspectRatioFrameLayout(viewContext)
+                val surface = android.view.SurfaceView(viewContext)
+                frame.addView(surface, android.widget.FrameLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT))
+                exoPlayer.setVideoSurfaceView(surface)
+                val holder = android.widget.FrameLayout(viewContext)
+                holder.addView(frame, android.widget.FrameLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.Gravity.CENTER))
+                holder
             },
-            update = { view ->
-                view.player = exoPlayer
-                view.resizeMode = if (fitMode) AspectRatioFrameLayout.RESIZE_MODE_FIT
+            update = { holder ->
+                val frame = holder.getChildAt(0) as AspectRatioFrameLayout
+                frame.resizeMode = if (fitMode) AspectRatioFrameLayout.RESIZE_MODE_FIT
                     else AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                if (videoRatio > 0f) frame.setAspectRatio(videoRatio)
             },
             modifier = Modifier.fillMaxSize()
         )
@@ -510,35 +500,4 @@ private fun TeamMark(mark: String) {
         Modifier.size(43.dp).clip(CircleShape).background(Color(0xFFEEF2F7)),
         contentAlignment = Alignment.Center
     ) { Text(mark, fontSize = 24.sp) }
-}
-
-@Composable
-private fun BottomNavigation(selected: String, onSelect: (String) -> Unit) {
-    val items = listOf("Favourites" to "★", "Sports" to "⚽", "Live Events" to "◉", "Categories" to "▣", "Menu" to "☷")
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp)
-            .clip(RoundedCornerShape(40.dp)).background(Color(0xFF202D43))
-            .padding(horizontal = 5.dp, vertical = 5.dp),
-        horizontalArrangement = Arrangement.SpaceEvenly,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        items.forEach { (label, icon) ->
-            val active = selected == label
-            Surface(
-                onClick = { onSelect(label) },
-                color = if (active) Color(0xFF263D59) else Color.Transparent,
-                shape = RoundedCornerShape(30.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Column(
-                    Modifier.padding(vertical = 8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(icon, color = if (active) Accent else Muted, fontSize = 25.sp)
-                    Text(label, color = if (active) Accent else Muted, fontSize = 10.sp,
-                        maxLines = 1)
-                }
-            }
-        }
-    }
 }

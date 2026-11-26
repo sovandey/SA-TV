@@ -1,10 +1,10 @@
 package com.bengaliptv.data
 
 object M3uParser {
-    private val attr = Regex("""([\\w-]+)="([^"]*)"""")
+    private val attr = Regex("""([\w-]+)="([^"]*)"""")
 
     fun parse(text: String, source: PlaylistSource): List<Channel> {
-        val lines = text.removePrefix("\\uFEFF").lines()
+        val lines = text.removePrefix("\uFEFF").lines()
         val result = mutableListOf<Channel>()
         var pending: Map<String, String> = emptyMap()
         var pendingName: String? = null
