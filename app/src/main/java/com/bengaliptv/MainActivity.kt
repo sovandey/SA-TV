@@ -364,7 +364,7 @@ private fun LivePlayerScreen(
                     useController = false
                     resizeMode = if (fitMode) AspectRatioFrameLayout.RESIZE_MODE_FIT
                         else AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                    player = exoPlayer
+                    this.player = exoPlayer
                     setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
                 }
             },
