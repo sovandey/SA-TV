@@ -1,4 +1,4 @@
-name: SA-TV Android APK Buil
+name: SA-TV Android APK Build
 
 on:
   workflow_dispatch:
