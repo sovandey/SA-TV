@@ -309,9 +309,13 @@ private fun LivePlayerScreen(
 
     LaunchedEffect(currentChannel.url) {
         errorText = null
-        exoPlayer.setMediaItem(MediaItem.fromUri(currentChannel.url))
-        exoPlayer.volume = if (muted) 0f else 1f
-        exoPlayer.prepare()
+        try {
+            exoPlayer.setMediaItem(MediaItem.fromUri(currentChannel.url))
+            exoPlayer.volume = if (muted) 0f else 1f
+            exoPlayer.prepare()
+        } catch (e: Exception) {
+            errorText = "Stream could not be played. Try another channel."
+        }
         exoPlayer.playWhenReady = true
         playing = true
     }
