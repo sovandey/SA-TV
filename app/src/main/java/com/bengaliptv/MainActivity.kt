@@ -1,6 +1,9 @@
 package com.bengaliptv
 
 import android.app.Activity
+import android.content.Context
+import android.media.AudioManager
+import android.provider.Settings
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.os.Build
@@ -11,7 +14,15 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -19,7 +30,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -31,12 +43,16 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
@@ -59,6 +75,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.work.*
 import coil.compose.SubcomposeAsyncImage
+import coil.request.ImageRequest
 import com.bengaliptv.data.Channel
 import com.bengaliptv.data.M3uParser
 import com.bengaliptv.data.PlaylistSource
@@ -66,6 +83,9 @@ import com.bengaliptv.data.RemoteSources
 import com.bengaliptv.work.PlaylistMonitorWorker
 import kotlinx.coroutines.delay
 import java.util.concurrent.TimeUnit
+import kotlin.math.cos
+import kotlin.math.roundToInt
+import kotlin.math.sin
 
 private val Bg = Color(0xFF101827)
 private val Panel = Color(0xFF192436)
@@ -317,7 +337,7 @@ private fun SATVHome(channels: List<Channel>, loading: Boolean, onReload: () -> 
                         modifier = Modifier.padding(start = 8.dp, top = 2.dp, bottom = 4.dp)
                     )
                 }
-                items(shown, key = { it.url }) { channel ->
+                items(shown, key = { it.url }, contentType = { "channel" }) { channel ->
                     ChannelCard(channel, false) { playingChannel = channel }
                 }
                 item { Spacer(Modifier.navigationBarsPadding().height(12.dp)) }
@@ -379,7 +399,10 @@ private fun ChannelCard(channel: Channel, highlight: Boolean, onClick: () -> Uni
                     Text(emoji, fontSize = 22.sp)
                 } else {
                     SubcomposeAsyncImage(
-                        model = channel.logo,
+                        model = ImageRequest.Builder(LocalContext.current)
+                            .data(channel.logo)
+                            .size(96)
+                            .build(),
                         contentDescription = channel.name,
                         contentScale = ContentScale.Fit,
                         modifier = Modifier.fillMaxSize().padding(6.dp),
@@ -404,6 +427,8 @@ private fun ChannelCard(channel: Channel, highlight: Boolean, onClick: () -> Uni
 
 // ───────────────────────── Player ─────────────────────────
 
+private val Glass = Color(0x33FFFFFF)
+
 @Composable
 private fun LivePlayerScreen(
     channels: List<Channel>,
@@ -415,6 +440,7 @@ private fun LivePlayerScreen(
     val activity = context as Activity
     val view = LocalView.current
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val audio = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
 
     val exoPlayer = remember {
         val http = androidx.media3.datasource.DefaultHttpDataSource.Factory()
@@ -431,11 +457,17 @@ private fun LivePlayerScreen(
     var controlsVisible by remember { mutableStateOf(true) }
     var controlsTick by remember { mutableStateOf(0) }
     var muted by remember { mutableStateOf(false) }
-    var fit by remember { mutableStateOf(true) }
+    var fitMode by remember { mutableStateOf(0) } // 0 = FIT, 1 = FILL, 2 = ZOOM
     var playing by remember { mutableStateOf(true) }
     var buffering by remember { mutableStateOf(true) }
     var errorText by remember { mutableStateOf<String?>(null) }
     var videoRatio by remember { mutableStateOf(0f) }
+    var locked by remember { mutableStateOf(false) }
+    var lockHint by remember { mutableStateOf(false) }
+    var lockTick by remember { mutableStateOf(0) }
+    var gKind by remember { mutableStateOf(0) } // 0 none, 1 volume, 2 brightness
+    var gValue by remember { mutableStateOf(0f) }
+    var gTick by remember { mutableStateOf(0) }
 
     val isRadio = current.group == "FM Radio"
     val index = channels.indexOfFirst { it.url == current.url }.coerceAtLeast(0)
@@ -453,6 +485,28 @@ private fun LivePlayerScreen(
     fun toggleOrientation() {
         activity.requestedOrientation = if (landscape) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         else ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+    }
+    fun togglePlay() {
+        if (playing) exoPlayer.pause() else {
+            if (exoPlayer.playbackState == Player.STATE_IDLE) exoPlayer.prepare()
+            exoPlayer.play()
+        }
+        controlsTick++
+    }
+    fun currentBrightness(): Float {
+        val b = activity.window.attributes.screenBrightness
+        if (b >= 0f) return b
+        return try {
+            Settings.System.getInt(activity.contentResolver, Settings.System.SCREEN_BRIGHTNESS) / 255f
+        } catch (e: Exception) {
+            0.5f
+        }
+    }
+    fun lockScreen(on: Boolean) {
+        locked = on
+        controlsVisible = false
+        lockHint = on
+        lockTick++
     }
 
     // stream loading
@@ -512,13 +566,16 @@ private fun LivePlayerScreen(
         onDispose { (context as androidx.activity.ComponentActivity).lifecycle.removeObserver(observer) }
     }
 
-    // screen on + rotation allowed while player is open
+    // screen on + rotation allowed while player is open; restore brightness on exit
     DisposableEffect(Unit) {
         view.keepScreenOn = true
         activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
         onDispose {
             view.keepScreenOn = false
             activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            val lp = activity.window.attributes
+            lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            activity.window.attributes = lp
             WindowCompat.getInsetsController(activity.window, view).show(WindowInsetsCompat.Type.systemBars())
         }
     }
@@ -534,28 +591,93 @@ private fun LivePlayerScreen(
         }
     }
 
-    // auto-hide controls
+    // auto-hide controls / indicators / lock hint
     LaunchedEffect(controlsVisible, controlsTick, playing) {
         if (controlsVisible && playing) {
             delay(4000)
             controlsVisible = false
         }
     }
+    LaunchedEffect(gTick) {
+        if (gKind != 0) {
+            delay(900)
+            gKind = 0
+        }
+    }
+    LaunchedEffect(lockTick) {
+        if (lockHint) {
+            delay(3000)
+            lockHint = false
+        }
+    }
 
     BackHandler {
-        if (landscape) toggleOrientation() else onBack()
+        if (locked) {
+            lockHint = true
+            lockTick++
+        } else if (landscape) toggleOrientation() else onBack()
     }
 
     val stage: @Composable (Modifier) -> Unit = { mod ->
         Box(
-            mod.background(Color.Black).clickable(
-                interactionSource = remember { MutableInteractionSource() }, indication = null
-            ) {
-                controlsVisible = !controlsVisible
-                controlsTick++
-            }
+            mod.background(Color.Black)
+                .pointerInput(locked) {
+                    detectTapGestures(
+                        onTap = {
+                            if (locked) {
+                                lockHint = !lockHint
+                                lockTick++
+                            } else {
+                                controlsVisible = !controlsVisible
+                                controlsTick++
+                            }
+                        },
+                        onDoubleTap = { if (!locked) togglePlay() }
+                    )
+                }
+                .pointerInput(locked) {
+                    if (!locked) {
+                        var side = 0
+                        var level = 0f
+                        detectVerticalDragGestures(
+                            onDragStart = { offset ->
+                                if (offset.x < size.width / 2f) {
+                                    side = 2
+                                    level = currentBrightness()
+                                } else {
+                                    side = 1
+                                    val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                    level = if (muted) 0f
+                                    else audio.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / max
+                                }
+                            },
+                            onDragEnd = { },
+                            onDragCancel = { },
+                            onVerticalDrag = { change, dragAmount ->
+                                change.consume()
+                                level = (level - dragAmount / size.height * 1.4f).coerceIn(0f, 1f)
+                                if (side == 2) {
+                                    val lp = activity.window.attributes
+                                    lp.screenBrightness = level.coerceAtLeast(0.02f)
+                                    activity.window.attributes = lp
+                                } else {
+                                    val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                    audio.setStreamVolume(AudioManager.STREAM_MUSIC, (level * max).roundToInt(), 0)
+                                    if (muted && level > 0f) {
+                                        muted = false
+                                        exoPlayer.volume = 1f
+                                    }
+                                }
+                                gKind = side
+                                gValue = level
+                                gTick++
+                            }
+                        )
+                    }
+                }
         ) {
-            if (isRadio) RadioArt() else VideoSurface(exoPlayer, fit, videoRatio, Modifier.fillMaxSize())
+            if (isRadio) RadioArt(current.name, playing)
+            else VideoSurface(exoPlayer, fitMode, videoRatio, Modifier.fillMaxSize())
 
             if (buffering && errorText == null) {
                 CircularProgressIndicator(Modifier.align(Alignment.Center).size(46.dp), color = Accent)
@@ -576,10 +698,28 @@ private fun LivePlayerScreen(
                 }
             }
 
-            if (controlsVisible) {
+            // volume / brightness indicator
+            if (gKind != 0) {
+                LevelIndicator(
+                    kind = gKind,
+                    value = gValue,
+                    barHeight = if (landscape) 130.dp else 64.dp,
+                    modifier = Modifier
+                        .align(if (gKind == 2) Alignment.CenterStart else Alignment.CenterEnd)
+                        .padding(horizontal = 26.dp)
+                )
+            }
+
+            // controls
+            AnimatedVisibility(
+                visible = controlsVisible && !locked,
+                modifier = Modifier.matchParentSize(),
+                enter = fadeIn(tween(180)),
+                exit = fadeOut(tween(260))
+            ) {
                 Box(
-                    Modifier.matchParentSize().background(
-                        Brush.verticalGradient(listOf(Color(0xB3000000), Color(0x00000000), Color(0xB3000000)))
+                    Modifier.fillMaxSize().background(
+                        Brush.verticalGradient(listOf(Color(0xCC000000), Color(0x00000000), Color(0xCC000000)))
                     )
                 ) {
                     Box(
@@ -592,7 +732,7 @@ private fun LivePlayerScreen(
                             Modifier.align(Alignment.TopStart).fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            CircleBtn(40.dp, Color(0x66000000), onClick = {
+                            CircleBtn(40.dp, Glass, onClick = {
                                 if (landscape) toggleOrientation() else onBack()
                             }) { GlyphIcon("back", Modifier.size(22.dp)) }
                             Spacer(Modifier.width(10.dp))
@@ -602,10 +742,15 @@ private fun LivePlayerScreen(
                                 Text(if (isRadio) "FM Radio" else (channelCategory(current) ?: ""),
                                     color = Color(0xFFCBD5E1), fontSize = 11.sp, maxLines = 1)
                             }
-                            CircleBtn(40.dp, Color(0x66000000), onClick = {
+                            CircleBtn(40.dp, Glass, onClick = { lockScreen(true) }) {
+                                GlyphIcon("unlock", Modifier.size(22.dp))
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            CircleBtn(40.dp, Glass, onClick = {
                                 muted = !muted
                                 exoPlayer.volume = if (muted) 0f else 1f
-                            }) { Text(if (muted) "🔇" else "🔊", fontSize = 18.sp) }
+                                controlsTick++
+                            }) { GlyphIcon(if (muted) "mute" else "volume", Modifier.size(22.dp)) }
                         }
                         // centre controls
                         Row(
@@ -613,17 +758,13 @@ private fun LivePlayerScreen(
                             horizontalArrangement = Arrangement.spacedBy(26.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            CircleBtn(48.dp, Color(0x66000000), onClick = { step(-1) }) {
+                            CircleBtn(48.dp, Glass, onClick = { step(-1) }) {
                                 GlyphIcon("prev", Modifier.size(26.dp))
                             }
-                            CircleBtn(68.dp, Accent, onClick = {
-                                if (playing) exoPlayer.pause() else {
-                                    if (exoPlayer.playbackState == Player.STATE_IDLE) exoPlayer.prepare()
-                                    exoPlayer.play()
-                                }
-                                controlsTick++
-                            }) { GlyphIcon(if (playing) "pause" else "play", Modifier.size(38.dp)) }
-                            CircleBtn(48.dp, Color(0x66000000), onClick = { step(1) }) {
+                            CircleBtn(70.dp, Accent, onClick = { togglePlay() }) {
+                                GlyphIcon(if (playing) "pause" else "play", Modifier.size(38.dp))
+                            }
+                            CircleBtn(48.dp, Glass, onClick = { step(1) }) {
                                 GlyphIcon("next", Modifier.size(26.dp))
                             }
                         }
@@ -632,29 +773,53 @@ private fun LivePlayerScreen(
                             Modifier.align(Alignment.BottomStart).fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Box(Modifier.size(9.dp).clip(CircleShape).background(LiveRed))
-                            Spacer(Modifier.width(6.dp))
-                            Text("LIVE", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            Spacer(Modifier.width(12.dp))
+                            Row(
+                                Modifier.clip(RoundedCornerShape(50)).background(Color(0x55E84F70))
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(Modifier.size(8.dp).clip(CircleShape).background(LiveRed))
+                                Spacer(Modifier.width(6.dp))
+                                Text("LIVE", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Spacer(Modifier.width(10.dp))
                             Text("${index + 1} / ${channels.size}", color = Color(0xFFCBD5E1), fontSize = 12.sp)
                             Spacer(Modifier.weight(1f))
                             if (!isRadio) {
                                 Surface(
-                                    onClick = { fit = !fit; controlsTick++ },
+                                    onClick = { fitMode = (fitMode + 1) % 3; controlsTick++ },
                                     shape = RoundedCornerShape(50),
-                                    color = Color(0x66000000)
+                                    color = Glass
                                 ) {
-                                    Text(if (fit) "FIT" else "FILL", color = Color.White, fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp))
+                                    Text(
+                                        when (fitMode) { 0 -> "FIT"; 1 -> "FILL"; else -> "ZOOM" },
+                                        color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp)
+                                    )
                                 }
                                 Spacer(Modifier.width(10.dp))
                             }
-                            CircleBtn(40.dp, Color(0x66000000), onClick = { toggleOrientation() }) {
+                            CircleBtn(40.dp, Glass, onClick = { toggleOrientation() }) {
                                 GlyphIcon(if (landscape) "exit" else "full", Modifier.size(22.dp))
                             }
                         }
                     }
+                }
+            }
+
+            // screen lock button (only visible after a tap while locked)
+            AnimatedVisibility(
+                visible = locked && lockHint,
+                modifier = Modifier.align(Alignment.CenterStart).padding(start = 22.dp),
+                enter = fadeIn(tween(150)),
+                exit = fadeOut(tween(250))
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircleBtn(52.dp, Color(0x99000000), onClick = { lockScreen(false) }) {
+                        GlyphIcon("lock", Modifier.size(26.dp), Accent)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text("Tap to unlock", color = Color.White, fontSize = 11.sp)
                 }
             }
         }
@@ -678,6 +843,9 @@ private fun LivePlayerScreen(
                     Spacer(Modifier.width(6.dp))
                     Text("LIVE  •  ${channelCategory(current) ?: ""}", color = Muted, fontSize = 12.sp)
                 }
+                Spacer(Modifier.height(6.dp))
+                Text("Swipe up/down: left side = brightness, right side = volume  •  Double-tap = play/pause",
+                    color = Muted, fontSize = 10.sp)
             }
             Text(
                 if (isRadio) "MORE STATIONS" else "MORE CHANNELS", color = Muted, fontSize = 11.sp,
@@ -687,7 +855,7 @@ private fun LivePlayerScreen(
                 Modifier.weight(1f).fillMaxWidth(),
                 contentPadding = PaddingValues(horizontal = 10.dp)
             ) {
-                items(channels, key = { it.url }) { ch ->
+                items(channels, key = { it.url }, contentType = { "channel" }) { ch ->
                     ChannelCard(ch, ch.url == current.url) { switchTo(ch) }
                 }
                 item { Spacer(Modifier.navigationBarsPadding().height(12.dp)) }
@@ -697,21 +865,22 @@ private fun LivePlayerScreen(
 }
 
 @Composable
-private fun VideoSurface(player: ExoPlayer, fit: Boolean, ratio: Float, modifier: Modifier = Modifier) {
+private fun VideoSurface(player: ExoPlayer, fitMode: Int, ratio: Float, modifier: Modifier = Modifier) {
     AndroidView(
-        modifier = modifier,
+        modifier = modifier.clipToBounds(),
         factory = { ctx ->
             val frame = AspectRatioFrameLayout(ctx)
-            val surface = android.view.SurfaceView(ctx)
+            val texture = android.view.TextureView(ctx)
             frame.addView(
-                surface,
+                texture,
                 android.widget.FrameLayout.LayoutParams(
                     android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                     android.view.ViewGroup.LayoutParams.MATCH_PARENT
                 )
             )
-            player.setVideoSurfaceView(surface)
+            player.setVideoTextureView(texture)
             val holder = android.widget.FrameLayout(ctx)
+            holder.clipChildren = true
             holder.addView(
                 frame,
                 android.widget.FrameLayout.LayoutParams(
@@ -724,15 +893,24 @@ private fun VideoSurface(player: ExoPlayer, fit: Boolean, ratio: Float, modifier
         },
         update = { holder ->
             val frame = holder.getChildAt(0) as AspectRatioFrameLayout
-            frame.resizeMode = if (fit) AspectRatioFrameLayout.RESIZE_MODE_FIT
-            else AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            frame.resizeMode = when (fitMode) {
+                0 -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+                1 -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+                else -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            }
             if (ratio > 0f) frame.setAspectRatio(ratio)
         }
     )
 }
 
 @Composable
-private fun RadioArt() {
+private fun RadioArt(name: String, playing: Boolean) {
+    val transition = rememberInfiniteTransition(label = "eq")
+    val b0 = transition.animateFloat(0.25f, 1f, infiniteRepeatable(tween(520, easing = LinearEasing), RepeatMode.Reverse), label = "b0")
+    val b1 = transition.animateFloat(0.25f, 1f, infiniteRepeatable(tween(650, easing = LinearEasing), RepeatMode.Reverse), label = "b1")
+    val b2 = transition.animateFloat(0.25f, 1f, infiniteRepeatable(tween(430, easing = LinearEasing), RepeatMode.Reverse), label = "b2")
+    val b3 = transition.animateFloat(0.25f, 1f, infiniteRepeatable(tween(580, easing = LinearEasing), RepeatMode.Reverse), label = "b3")
+    val b4 = transition.animateFloat(0.25f, 1f, infiniteRepeatable(tween(470, easing = LinearEasing), RepeatMode.Reverse), label = "b4")
     Box(
         Modifier.fillMaxSize().background(
             Brush.verticalGradient(listOf(Color(0xFF16324A), Color(0xFF0B1220)))
@@ -740,10 +918,48 @@ private fun RadioArt() {
         contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("📻", fontSize = 56.sp)
-            Spacer(Modifier.height(6.dp))
-            Text("LIVE RADIO", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Text("📻", fontSize = 46.sp)
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.height(34.dp),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.Bottom
+            ) {
+                listOf(b0, b1, b2, b3, b4).forEach { v ->
+                    Box(
+                        Modifier.width(6.dp).fillMaxHeight(if (playing) v.value else 0.25f)
+                            .clip(RoundedCornerShape(3.dp)).background(Accent)
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text("LIVE RADIO", color = Accent, fontSize = 11.sp, fontWeight = FontWeight.Bold)
         }
+    }
+}
+
+@Composable
+private fun LevelIndicator(kind: Int, value: Float, barHeight: androidx.compose.ui.unit.Dp, modifier: Modifier) {
+    Column(
+        modifier.clip(RoundedCornerShape(22.dp)).background(Color(0xB30B1220))
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        GlyphIcon(
+            if (kind == 2) "sun" else if (value <= 0f) "mute" else "volume",
+            Modifier.size(24.dp)
+        )
+        Spacer(Modifier.height(8.dp))
+        Box(
+            Modifier.width(6.dp).height(barHeight).clip(RoundedCornerShape(3.dp)).background(Color(0x44FFFFFF))
+        ) {
+            Box(
+                Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                    .fillMaxHeight(value.coerceIn(0f, 1f)).background(Accent)
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Text("${(value * 100).roundToInt()}%", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
     }
 }
 
@@ -815,6 +1031,54 @@ private fun GlyphIcon(kind: String, modifier: Modifier = Modifier, color: Color 
                 drawLine(color, Offset(w * .4f, h * .6f), Offset(w * .18f, h * .6f), sw, StrokeCap.Round)
                 drawLine(color, Offset(w * .6f, h * .82f), Offset(w * .6f, h * .6f), sw, StrokeCap.Round)
                 drawLine(color, Offset(w * .6f, h * .6f), Offset(w * .82f, h * .6f), sw, StrokeCap.Round)
+            }
+            "volume", "mute" -> {
+                val body = Path().apply {
+                    moveTo(w * .10f, h * .38f); lineTo(w * .28f, h * .38f); lineTo(w * .50f, h * .18f)
+                    lineTo(w * .50f, h * .82f); lineTo(w * .28f, h * .62f); lineTo(w * .10f, h * .62f); close()
+                }
+                drawPath(body, color)
+                if (kind == "volume") {
+                    val r1 = w * .17f
+                    val r2 = w * .31f
+                    drawArc(color, -50f, 100f, false, Offset(w * .50f - r1, h * .5f - r1), Size(r1 * 2, r1 * 2),
+                        style = Stroke(sw, cap = StrokeCap.Round))
+                    drawArc(color, -50f, 100f, false, Offset(w * .50f - r2, h * .5f - r2), Size(r2 * 2, r2 * 2),
+                        style = Stroke(sw, cap = StrokeCap.Round))
+                } else {
+                    drawLine(color, Offset(w * .64f, h * .36f), Offset(w * .90f, h * .64f), sw, StrokeCap.Round)
+                    drawLine(color, Offset(w * .90f, h * .36f), Offset(w * .64f, h * .64f), sw, StrokeCap.Round)
+                }
+            }
+            "sun" -> {
+                val c = Offset(w * .5f, h * .5f)
+                drawCircle(color, radius = w * .17f, center = c)
+                for (i in 0 until 8) {
+                    val a = Math.toRadians(i * 45.0)
+                    val r1 = w * .28
+                    val r2 = w * .42
+                    drawLine(
+                        color,
+                        Offset(c.x + (cos(a) * r1).toFloat(), c.y + (sin(a) * r1).toFloat()),
+                        Offset(c.x + (cos(a) * r2).toFloat(), c.y + (sin(a) * r2).toFloat()),
+                        sw, StrokeCap.Round
+                    )
+                }
+            }
+            "lock" -> {
+                drawArc(color, 180f, 180f, false, Offset(w * .32f, h * .14f), Size(w * .36f, h * .5f),
+                    style = Stroke(sw, cap = StrokeCap.Round))
+                drawLine(color, Offset(w * .32f, h * .39f), Offset(w * .32f, h * .48f), sw, StrokeCap.Round)
+                drawLine(color, Offset(w * .68f, h * .39f), Offset(w * .68f, h * .48f), sw, StrokeCap.Round)
+                drawRoundRect(color, Offset(w * .22f, h * .45f), Size(w * .56f, h * .40f),
+                    CornerRadius(w * .07f, w * .07f))
+            }
+            "unlock" -> {
+                drawArc(color, 180f, 180f, false, Offset(w * .32f, h * .04f), Size(w * .36f, h * .5f),
+                    style = Stroke(sw, cap = StrokeCap.Round))
+                drawLine(color, Offset(w * .32f, h * .29f), Offset(w * .32f, h * .48f), sw, StrokeCap.Round)
+                drawRoundRect(color, Offset(w * .22f, h * .45f), Size(w * .56f, h * .40f),
+                    CornerRadius(w * .07f, w * .07f))
             }
         }
     }
